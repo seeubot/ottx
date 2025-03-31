@@ -908,4 +908,184 @@ class ClientProtection {
                 
                 // Check if there are unusual gaps in the timing
                 const connectTime = entry.connectEnd - entry.connectStart;
-                const requestTime = entry.responseStart - entry.
+                const requestTime = entry.responseStart - entry.requestStart;
+                const responseTime = entry.responseEnd - entry.responseStart;
+                
+                // Check for unusual timing patterns that suggest packet capture
+                // Usually packet capture tools add overhead to these timings
+                const hasAnomaly = connectTime > 100 || 
+                                   (requestTime > 0 && requestTime < 5) || 
+                                   (responseTime / loadTime < 0.5);
+                                   
+                resolve(hasAnomaly);
+              } else {
+                resolve(false);
+              }
+            } else {
+              resolve(false);
+            }
+          }, 100);
+        };
+        
+        img.onerror = () => resolve(false);
+        img.src = `/api/pixel.gif?_=${random}`;
+        
+        // Timeout after 2 seconds
+        setTimeout(() => resolve(false), 2000);
+      } catch (err) {
+        console.error('Network timing check error:', err);
+        resolve(false);
+      }
+    });
+  }
+
+  /**
+   * Handle security threat
+   * @param {string} message - Security threat message
+   */
+  handleSecurityThreat(message) {
+    // Notify server about the security issue
+    if (this.socket && this.socket.connected) {
+      this.socket.emit('securityThreat', { message });
+    }
+    
+    // Stop the stream
+    this.stopProtection();
+    
+    // Notify the application about the security issue
+    if (typeof this.config.onSecurityThreat === 'function') {
+      this.config.onSecurityThreat(message);
+    }
+    
+    // Display error message to user
+    console.error('Security threat detected:', message);
+  }
+}
+
+/**
+ * Server-side Express application
+ */
+const app = express();
+const server = http.createServer(app);
+const io = socketio(server);
+
+// Serve static files
+app.use(express.static('public'));
+app.use(express.json());
+
+// Initialize protection server
+const protectionServer = new OTTProtectionServer({
+  serverPorts: [3000, 8080],
+  vpnCheckEnabled: true,
+  packetCaptureCheckEnabled: true
+});
+
+// Start protection server
+protectionServer.start().catch((error) => {
+  logger.error(`Failed to start protection server: ${error.message}`);
+});
+
+// Socket.io connection handling
+io.on('connection', (socket) => {
+  const clientIp = socket.handshake.address.replace(/^::ffff:/, '');
+  
+  logger.info(`New socket connection from ${clientIp}`);
+  
+  // Check if client is blocked
+  if (protectionServer.blockedIps.has(clientIp)) {
+    logger.warn(`Blocked client attempted to connect: ${clientIp}`);
+    socket.disconnect(true);
+    return;
+  }
+  
+  // Client security reports
+  socket.on('speedMeasurement', (data) => {
+    logger.info(`Speed measurement from ${clientIp}: ${data.speed.toFixed(2)} Mbps`);
+  });
+  
+  socket.on('vpnCheck', (data) => {
+    if (data.webrtcLeak || data.timezoneInconsistency || data.ipGeoAnomaly) {
+      logger.warn(`VPN indicators detected from ${clientIp}: ${JSON.stringify(data)}`);
+      protectionServer._investigateClient(clientIp);
+    }
+  });
+  
+  socket.on('packetCaptureCheck', (data) => {
+    if (data.processingOverhead || data.performanceAnomaly || data.networkTimingAnomaly) {
+      logger.warn(`Packet capture indicators detected from ${clientIp}: ${JSON.stringify(data)}`);
+      protectionServer._investigateClient(clientIp);
+    }
+  });
+  
+  socket.on('securityThreat', (data) => {
+    logger.warn(`Security threat reported by client ${clientIp}: ${data.message}`);
+    protectionServer._blockIp(clientIp);
+  });
+  
+  // Disconnect handling
+  socket.on('disconnect', () => {
+    logger.info(`Socket disconnected: ${clientIp}`);
+  });
+});
+
+// API endpoints
+app.get('/api/client-protection.js', (req, res) => {
+  // Serve the client protection code
+  const clientProtectionCode = fs.readFileSync('./client-protection.js', 'utf8');
+  res.setHeader('Content-Type', 'application/javascript');
+  res.send(clientProtectionCode);
+});
+
+app.get('/api/healthcheck', (req, res) => {
+  res.status(200).send('OK');
+});
+
+app.get('/api/pixel.gif', (req, res) => {
+  // Serve a 1x1 transparent GIF
+  const pixel = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+  res.setHeader('Content-Type', 'image/gif');
+  res.send(pixel);
+});
+
+// Stream registration endpoint
+app.post('/api/register-stream', (req, res) => {
+  const { clientIp, clientPort, serverPort } = req.body;
+  
+  if (!clientIp || !clientPort || !serverPort) {
+    return res.status(400).json({ error: 'Missing required parameters' });
+  }
+  
+  const registered = protectionServer.registerStream(clientIp, clientPort, serverPort);
+  
+  if (registered) {
+    res.status(200).json({ status: 'registered' });
+  } else {
+    res.status(403).json({ error: 'Client is blocked or invalid' });
+  }
+});
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  logger.info(`Server running on port ${PORT}`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  logger.info('Shutting down...');
+  
+  // Stop the protection server
+  await protectionServer.stop();
+  
+  // Close the HTTP server
+  server.close(() => {
+    logger.info('Server closed');
+    process.exit(0);
+  });
+});
+
+// Export the classes for use in other files
+module.exports = {
+  OTTProtectionServer,
+  ClientProtection
+};
