@@ -1,20 +1,514 @@
 /**
- * OTT Content Protection System
+ * OTT Content Protection System for Node.js
+ * Unified solution handling both client and server-side protection
  * 
  * Features:
- * 1. Monitors data transfer speed between server and client
- * 2. Detects VPN usage and packet capture tools
- * 3. Automatically stops stream if security threats are detected
+ * 1. Server-side network monitoring and protection
+ * 2. Client-side detection for VPN, packet capture tools
+ * 3. Real-time data transfer speed monitoring
+ * 4. Automatic stream termination on security threats
  */
 
-class OTTProtectionSystem {
+const express = require('express');
+const http = require('http');
+const socketio = require('socket.io');
+const pcap = require('pcap');
+const ip = require('ip');
+const child_process = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
+const util = require('util');
+const winston = require('winston');
+const arp = require('node-arp');
+const pcapParser = require('pcap-parser');
+const exec = util.promisify(child_process.exec);
+
+// Configure logger
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ level, message, timestamp }) => {
+      return `${timestamp} ${level}: ${message}`;
+    })
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'ott-protection.log' })
+  ]
+});
+
+/**
+ * OTT Protection Server Class
+ * Handles network-level monitoring and protection
+ */
+class OTTProtectionServer {
   constructor(config = {}) {
     // Default configuration
     this.config = {
-      maxSpeedVariationThreshold: 0.3, // 30% variation threshold for speed anomalies
-      speedCheckInterval: 2000,        // Check speed every 2 seconds
-      vpnCheckInterval: 5000,          // Check for VPN every 5 seconds
-      packetCaptureCheckInterval: 3000, // Check for packet capture every 3 seconds
+      serverPorts: [8080, 8443],
+      monitoringInterval: 5000, // ms
+      networkScanInterval: 30000, // ms
+      maxSpeedVariationThreshold: 0.3,
+      vpnCheckEnabled: true,
+      packetCaptureCheckEnabled: true,
+      blockDuration: 24 * 60 * 60 * 1000, // 24 hours in ms
+      ...config
+    };
+
+    // Server state
+    this.serverIp = this._getLocalIp();
+    this.interfaces = this._getNetworkInterfaces();
+    this.isRunning = false;
+    this.activeStreams = new Map(); // Map of active streams
+    this.blockedIps = new Set(); // Set of blocked IP addresses
+    this.networkMap = new Map(); // Map of IP to MAC addresses
+    this.previousNetworkMap = new Map(); // Previous network state
+    this.captureHandles = []; // Store pcap capture handles
+    
+    logger.info(`OTT Protection Server initialized on ${this.serverIp}`);
+    logger.info(`Monitoring interfaces: ${this.interfaces.join(', ')}`);
+  }
+
+  /**
+   * Get local IP address
+   */
+  _getLocalIp() {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name]) {
+        // Skip internal and non-ipv4 addresses
+        if (iface.family === 'IPv4' && !iface.internal) {
+          return iface.address;
+        }
+      }
+    }
+    return '127.0.0.1';
+  }
+
+  /**
+   * Get network interfaces
+   */
+  _getNetworkInterfaces() {
+    const interfaces = [];
+    const networkInterfaces = os.networkInterfaces();
+    
+    for (const name of Object.keys(networkInterfaces)) {
+      for (const iface of networkInterfaces[name]) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          interfaces.push(name);
+          break;
+        }
+      }
+    }
+    
+    return interfaces.length > 0 ? interfaces : ['eth0'];
+  }
+
+  /**
+   * Start the protection server
+   */
+  async start() {
+    if (this.isRunning) return;
+    
+    this.isRunning = true;
+    logger.info('OTT Protection Server starting...');
+    
+    // Start network scanning
+    this.networkScanInterval = setInterval(() => {
+      this._scanNetwork();
+    }, this.config.networkScanInterval);
+    
+    // Start packet capture on all interfaces
+    for (const iface of this.interfaces) {
+      try {
+        this._startPacketCapture(iface);
+      } catch (error) {
+        logger.error(`Failed to start packet capture on ${iface}: ${error.message}`);
+      }
+    }
+    
+    // Start monitoring active streams
+    this.monitoringInterval = setInterval(() => {
+      this._monitorActiveStreams();
+    }, this.config.monitoringInterval);
+    
+    logger.info('OTT Protection Server started successfully');
+  }
+
+  /**
+   * Stop the protection server
+   */
+  stop() {
+    if (!this.isRunning) return;
+    
+    this.isRunning = false;
+    logger.info('OTT Protection Server stopping...');
+    
+    // Clear all intervals
+    clearInterval(this.networkScanInterval);
+    clearInterval(this.monitoringInterval);
+    
+    // Stop all packet captures
+    for (const handle of this.captureHandles) {
+      try {
+        handle.close();
+      } catch (error) {
+        logger.error(`Error closing capture: ${error.message}`);
+      }
+    }
+    
+    // Clear firewall rules for blocked IPs
+    this._clearFirewallRules();
+    
+    logger.info('OTT Protection Server stopped');
+  }
+
+  /**
+   * Start packet capture on interface
+   * @param {string} iface - Network interface
+   */
+  _startPacketCapture(iface) {
+    try {
+      // Create a filter for our server ports
+      const portFilter = this.config.serverPorts.map(port => `port ${port}`).join(' or ');
+      const filter = `ip and (${portFilter})`;
+      
+      // Start packet capture
+      logger.info(`Starting packet capture on ${iface} with filter: ${filter}`);
+      const pcapSession = pcap.createSession(iface, filter);
+      
+      // Store the handle
+      this.captureHandles.push(pcapSession);
+      
+      // Handle packets
+      pcapSession.on('packet', (rawPacket) => {
+        try {
+          const packet = pcap.decode.packet(rawPacket);
+          this._processPacket(packet);
+        } catch (error) {
+          logger.error(`Error processing packet: ${error.message}`);
+        }
+      });
+      
+    } catch (error) {
+      logger.error(`Failed to set up packet capture on ${iface}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Process captured packet
+   * @param {object} packet - Parsed packet object
+   */
+  _processPacket(packet) {
+    if (!packet.payload || !packet.payload.payload) return;
+    
+    const ipPacket = packet.payload;
+    const tcpPacket = ipPacket.payload;
+    
+    if (!tcpPacket || !tcpPacket.dport) return;
+    
+    const srcIp = ipPacket.saddr.addr.join('.');
+    const dstIp = ipPacket.daddr.addr.join('.');
+    const srcPort = tcpPacket.sport;
+    const dstPort = tcpPacket.dport;
+    
+    // Check if this is traffic to/from our server ports
+    let streamId = null;
+    let clientIp = null;
+    
+    if (dstIp === this.serverIp && this.config.serverPorts.includes(dstPort)) {
+      // Inbound traffic to server
+      streamId = `${srcIp}:${srcPort}-${dstPort}`;
+      clientIp = srcIp;
+    } else if (srcIp === this.serverIp && this.config.serverPorts.includes(srcPort)) {
+      // Outbound traffic from server
+      streamId = `${dstIp}:${dstPort}-${srcPort}`;
+      clientIp = dstIp;
+    }
+    
+    if (streamId && clientIp) {
+      // Check if client is blocked
+      if (this.blockedIps.has(clientIp)) {
+        logger.warn(`Detected traffic from blocked IP: ${clientIp}`);
+        this._terminateStream(streamId);
+        return;
+      }
+      
+      // Update stream information
+      if (!this.activeStreams.has(streamId)) {
+        this.activeStreams.set(streamId, {
+          clientIp,
+          startTime: Date.now(),
+          lastActivity: Date.now(),
+          bytesSent: tcpPacket.data ? tcpPacket.data.length : 0,
+          packetCount: 1
+        });
+        logger.info(`New stream detected: ${streamId}`);
+      } else {
+        const stream = this.activeStreams.get(streamId);
+        stream.bytesSent += tcpPacket.data ? tcpPacket.data.length : 0;
+        stream.packetCount += 1;
+        stream.lastActivity = Date.now();
+      }
+    }
+  }
+
+  /**
+   * Scan network for devices
+   */
+  async _scanNetwork() {
+    try {
+      // Store previous network map
+      this.previousNetworkMap = new Map(this.networkMap);
+      
+      // Scan ARP table to find devices
+      const { stdout } = await exec('arp -a');
+      
+      // Parse ARP table output
+      this.networkMap.clear();
+      
+      const lines = stdout.split('\n');
+      for (const line of lines) {
+        const match = line.match(/\((\d+\.\d+\.\d+\.\d+)\) at ([0-9A-Fa-f:]+)/);
+        if (match) {
+          const [, deviceIp, macAddress] = match;
+          this.networkMap.set(deviceIp, macAddress.toLowerCase());
+        }
+      }
+      
+      // Check for new devices
+      this._checkNewDevices();
+      
+      // Check for suspicious network activity
+      this._checkSuspiciousActivity();
+      
+    } catch (error) {
+      logger.error(`Error scanning network: ${error.message}`);
+    }
+  }
+
+  /**
+   * Check for new devices on the network
+   */
+  _checkNewDevices() {
+    for (const [ip, mac] of this.networkMap.entries()) {
+      if (!this.previousNetworkMap.has(ip) && ip !== this.serverIp) {
+        logger.warn(`New device detected on network: ${ip} (MAC: ${mac})`);
+        
+        // Check if this device is using any active streams
+        for (const [streamId, stream] of this.activeStreams.entries()) {
+          if (stream.clientIp === ip) {
+            logger.info(`New device ${ip} has an active stream: ${streamId}`);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Check for suspicious network activity
+   */
+  _checkSuspiciousActivity() {
+    // Check for duplicate MACs (potential spoofing)
+    const macAddresses = new Map();
+    
+    for (const [ip, mac] of this.networkMap.entries()) {
+      if (macAddresses.has(mac)) {
+        const existingIp = macAddresses.get(mac);
+        logger.warn(`Potential ARP spoofing detected: ${ip} and ${existingIp} have same MAC ${mac}`);
+        
+        // Block both IPs
+        this._blockIp(ip);
+        this._blockIp(existingIp);
+      } else {
+        macAddresses.set(mac, ip);
+      }
+    }
+    
+    // Check for incomplete ARP entries
+    // (This is OS-specific but would be implemented here)
+  }
+
+  /**
+   * Monitor active streams for suspicious behavior
+   */
+  _monitorActiveStreams() {
+    const now = Date.now();
+    const expiredStreams = [];
+    
+    for (const [streamId, stream] of this.activeStreams.entries()) {
+      // Check for expired streams (inactive for more than 1 hour)
+      if (now - stream.lastActivity > 3600000) {
+        expiredStreams.push(streamId);
+        continue;
+      }
+      
+      // Calculate stream metrics
+      const duration = (now - stream.startTime) / 1000; // seconds
+      const avgBandwidth = (stream.bytesSent * 8) / (duration * 1000000); // Mbps
+      
+      // Log suspicious low bandwidth (potential packet capturing)
+      if (duration > 10 && avgBandwidth < 0.5) {
+        logger.warn(`Suspicious low bandwidth detected for stream ${streamId}: ${avgBandwidth.toFixed(2)} Mbps`);
+        
+        // Investigate this client further
+        this._investigateClient(stream.clientIp);
+      }
+    }
+    
+    // Remove expired streams
+    for (const streamId of expiredStreams) {
+      this.activeStreams.delete(streamId);
+      logger.info(`Stream expired: ${streamId}`);
+    }
+  }
+
+  /**
+   * Investigate client for suspicious activity
+   * @param {string} clientIp - Client IP address
+   */
+  async _investigateClient(clientIp) {
+    // Count client's active streams
+    let streamCount = 0;
+    for (const stream of this.activeStreams.values()) {
+      if (stream.clientIp === clientIp) {
+        streamCount++;
+      }
+    }
+    
+    // If client has multiple streams, that's suspicious
+    if (streamCount > 3) {
+      logger.warn(`Client ${clientIp} has ${streamCount} active streams - blocking`);
+      this._blockIp(clientIp);
+      return;
+    }
+    
+    // Additional investigation methods would be implemented here
+  }
+
+  /**
+   * Block an IP address
+   * @param {string} clientIp - IP address to block
+   */
+  async _blockIp(clientIp) {
+    if (this.blockedIps.has(clientIp)) return;
+    
+    logger.warn(`Blocking IP address: ${clientIp}`);
+    this.blockedIps.add(clientIp);
+    
+    // Terminate all streams from this client
+    this._terminateClientStreams(clientIp);
+    
+    // Add firewall rules
+    try {
+      if (os.platform() === 'linux') {
+        await exec(`iptables -A INPUT -s ${clientIp} -j DROP`);
+        await exec(`iptables -A OUTPUT -d ${clientIp} -j DROP`);
+      } else if (os.platform() === 'win32') {
+        // Windows firewall commands would go here
+        await exec(`netsh advfirewall firewall add rule name="OTT_BLOCK_${clientIp}" dir=in action=block remoteip=${clientIp}`);
+        await exec(`netsh advfirewall firewall add rule name="OTT_BLOCK_${clientIp}" dir=out action=block remoteip=${clientIp}`);
+      }
+    } catch (error) {
+      logger.error(`Failed to add firewall rules for ${clientIp}: ${error.message}`);
+    }
+  }
+
+  /**
+   * Clear firewall rules for all blocked IPs
+   */
+  async _clearFirewallRules() {
+    for (const blockedIp of this.blockedIps) {
+      try {
+        if (os.platform() === 'linux') {
+          await exec(`iptables -D INPUT -s ${blockedIp} -j DROP`);
+          await exec(`iptables -D OUTPUT -d ${blockedIp} -j DROP`);
+        } else if (os.platform() === 'win32') {
+          await exec(`netsh advfirewall firewall delete rule name="OTT_BLOCK_${blockedIp}"`);
+        }
+      } catch (error) {
+        logger.error(`Failed to remove firewall rules for ${blockedIp}: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Terminate all streams from a specific client
+   * @param {string} clientIp - Client IP address
+   */
+  _terminateClientStreams(clientIp) {
+    let terminatedCount = 0;
+    
+    for (const [streamId, stream] of this.activeStreams.entries()) {
+      if (stream.clientIp === clientIp) {
+        this._terminateStream(streamId);
+        terminatedCount++;
+      }
+    }
+    
+    logger.info(`Terminated ${terminatedCount} streams from client ${clientIp}`);
+    return terminatedCount;
+  }
+
+  /**
+   * Terminate a specific stream
+   * @param {string} streamId - Stream identifier
+   */
+  _terminateStream(streamId) {
+    if (!this.activeStreams.has(streamId)) return false;
+    
+    logger.info(`Terminating stream: ${streamId}`);
+    
+    const stream = this.activeStreams.get(streamId);
+    this.activeStreams.delete(streamId);
+    
+    // Send reset packet (would be implemented via raw sockets)
+    // This is simplified for the demo
+    
+    return true;
+  }
+
+  /**
+   * Register a new stream with the system
+   * @param {string} clientIp - Client IP address
+   * @param {number} clientPort - Client port
+   * @param {number} serverPort - Server port
+   */
+  registerStream(clientIp, clientPort, serverPort) {
+    // Check if client is blocked
+    if (this.blockedIps.has(clientIp)) {
+      logger.warn(`Rejected connection from blocked client: ${clientIp}`);
+      return false;
+    }
+    
+    const streamId = `${clientIp}:${clientPort}-${serverPort}`;
+    
+    this.activeStreams.set(streamId, {
+      clientIp,
+      startTime: Date.now(),
+      lastActivity: Date.now(),
+      bytesSent: 0,
+      packetCount: 0
+    });
+    
+    logger.info(`Registered stream ${streamId}`);
+    return true;
+  }
+}
+
+/**
+ * Client-side protection system (to be sent to the browser)
+ */
+class ClientProtection {
+  constructor(config = {}) {
+    this.config = {
+      maxSpeedVariationThreshold: 0.3,
+      speedCheckInterval: 2000,
+      vpnCheckInterval: 5000,
+      packetCaptureCheckInterval: 3000,
       ...config
     };
     
@@ -23,16 +517,33 @@ class OTTProtectionSystem {
     this.speedCheckTimer = null;
     this.vpnCheckTimer = null;
     this.packetCaptureCheckTimer = null;
+    this.socket = null;
   }
 
   /**
-   * Start the protection system and monitoring
+   * Connect to the server for security reporting
+   * @param {string} serverUrl - Socket.io server URL
+   */
+  connect(serverUrl) {
+    this.socket = io(serverUrl);
+    
+    this.socket.on('connect', () => {
+      console.log('Connected to protection server');
+    });
+    
+    this.socket.on('disconnect', () => {
+      console.log('Disconnected from protection server');
+    });
+  }
+
+  /**
+   * Start the client-side protection system
    */
   startProtection() {
     if (this.isStreaming) return;
     
     this.isStreaming = true;
-    console.log("Protection system started");
+    console.log('Client protection system started');
     
     // Start monitoring speed
     this.speedCheckTimer = setInterval(() => this.checkDataTransferSpeed(), this.config.speedCheckInterval);
@@ -45,7 +556,7 @@ class OTTProtectionSystem {
   }
 
   /**
-   * Stop the protection system and all monitoring
+   * Stop the client-side protection system
    */
   stopProtection() {
     this.isStreaming = false;
@@ -55,11 +566,11 @@ class OTTProtectionSystem {
     clearInterval(this.vpnCheckTimer);
     clearInterval(this.packetCaptureCheckTimer);
     
-    console.log("Protection system stopped");
+    console.log('Client protection system stopped');
   }
 
   /**
-   * Measures current data transfer speed
+   * Measure current data transfer speed
    * @returns {Promise<number>} Speed in Mbps
    */
   async measureCurrentSpeed() {
@@ -88,7 +599,7 @@ class OTTProtectionSystem {
   }
 
   /**
-   * Checks if current data transfer speed indicates potential packet capture
+   * Check data transfer speed for anomalies
    */
   async checkDataTransferSpeed() {
     if (!this.isStreaming) return;
@@ -96,6 +607,11 @@ class OTTProtectionSystem {
     try {
       const currentSpeed = await this.measureCurrentSpeed();
       console.log(`Current transfer speed: ${currentSpeed.toFixed(2)} Mbps`);
+      
+      // Report to server
+      if (this.socket && this.socket.connected) {
+        this.socket.emit('speedMeasurement', { speed: currentSpeed });
+      }
       
       // Store last 5 measurements
       this.lastSpeedMeasurements.push(currentSpeed);
@@ -106,17 +622,17 @@ class OTTProtectionSystem {
       // Only analyze if we have enough measurements
       if (this.lastSpeedMeasurements.length >= 3) {
         if (this.detectSpeedAnomaly()) {
-          console.warn("Speed anomaly detected - possible packet capture");
-          this.handleSecurityThreat("Unusual speed variation detected. Stream terminated for security reasons.");
+          console.warn('Speed anomaly detected - possible packet capture');
+          this.handleSecurityThreat('Unusual speed variation detected. Stream terminated for security reasons.');
         }
       }
     } catch (error) {
-      console.error("Error measuring speed:", error);
+      console.error('Error measuring speed:', error);
     }
   }
 
   /**
-   * Analyzes speed measurements to detect anomalies
+   * Detect speed anomalies
    * @returns {boolean} True if anomaly detected
    */
   detectSpeedAnomaly() {
@@ -132,7 +648,7 @@ class OTTProtectionSystem {
   }
 
   /**
-   * Checks for VPN usage
+   * Check for VPN usage
    */
   async checkForVPN() {
     if (!this.isStreaming) return;
@@ -142,16 +658,16 @@ class OTTProtectionSystem {
       const vpnDetected = await this.detectVPN();
       
       if (vpnDetected) {
-        console.warn("VPN usage detected");
-        this.handleSecurityThreat("VPN detected. Streaming is not allowed through VPN connections.");
+        console.warn('VPN usage detected');
+        this.handleSecurityThreat('VPN detected. Streaming is not allowed through VPN connections.');
       }
     } catch (error) {
-      console.error("Error checking for VPN:", error);
+      console.error('Error checking for VPN:', error);
     }
   }
 
   /**
-   * Detects if user is using a VPN
+   * Detect VPN usage
    * @returns {Promise<boolean>} True if VPN detected
    */
   async detectVPN() {
@@ -164,21 +680,27 @@ class OTTProtectionSystem {
     // Method 3: IP geolocation anomaly
     const hasIPGeoAnomaly = await this.checkIPGeolocationAnomaly();
     
+    // Report to server
+    if (this.socket && this.socket.connected) {
+      this.socket.emit('vpnCheck', {
+        webrtcLeak: hasWebRTCLeak,
+        timezoneInconsistency: hasTimezoneInconsistency,
+        ipGeoAnomaly: hasIPGeoAnomaly
+      });
+    }
+    
     return hasWebRTCLeak || hasTimezoneInconsistency || hasIPGeoAnomaly;
   }
 
   /**
-   * Check for WebRTC leaks that might reveal VPN usage
+   * Check for WebRTC leaks
    * @returns {Promise<boolean>}
    */
   async checkWebRTCLeak() {
     return new Promise((resolve) => {
       try {
-        // This is a simplified implementation
-        // In production, you would implement a full WebRTC leak test
-        
         const pc = new RTCPeerConnection({
-          iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
         });
         
         let localIPs = new Set();
@@ -210,7 +732,7 @@ class OTTProtectionSystem {
           }
         };
         
-        pc.createDataChannel("");
+        pc.createDataChannel('');
         pc.createOffer()
           .then(offer => pc.setLocalDescription(offer))
           .catch(() => resolve(false));
@@ -221,14 +743,14 @@ class OTTProtectionSystem {
           resolve(false);
         }, 1000);
       } catch (err) {
-        console.error("WebRTC check error:", err);
+        console.error('WebRTC check error:', err);
         resolve(false);
       }
     });
   }
 
   /**
-   * Check for timezone inconsistencies that might indicate VPN
+   * Check for timezone inconsistencies
    * @returns {boolean}
    */
   checkTimezoneInconsistency() {
@@ -240,34 +762,28 @@ class OTTProtectionSystem {
       // For demo purposes, we'll just return false
       return false;
     } catch (err) {
-      console.error("Timezone check error:", err);
+      console.error('Timezone check error:', err);
       return false;
     }
   }
 
   /**
-   * Check for IP geolocation anomalies that might indicate VPN
+   * Check for IP geolocation anomalies
    * @returns {Promise<boolean>}
    */
   async checkIPGeolocationAnomaly() {
     try {
-      // In a real implementation, you would make a server call to check IP geolocation
-      // For demo purposes, we'll simulate an API call
-      return new Promise((resolve) => {
-        // Simulate API call delay
-        setTimeout(() => {
-          // For demo purposes - would need actual IP check logic via server
-          resolve(false);
-        }, 500);
-      });
+      // In a real implementation, this would make a server-side request
+      // to check IP geolocation vs browser language/timezone
+      return false;
     } catch (err) {
-      console.error("IP geolocation check error:", err);
+      console.error('IP geolocation check error:', err);
       return false;
     }
   }
 
   /**
-   * Checks for packet capture tools
+   * Check for packet capture tools
    */
   async checkForPacketCapture() {
     if (!this.isStreaming) return;
@@ -277,16 +793,16 @@ class OTTProtectionSystem {
       const packetCaptureDetected = await this.detectPacketCapture();
       
       if (packetCaptureDetected) {
-        console.warn("Packet capture detected");
-        this.handleSecurityThreat("Network traffic monitoring detected. Stream terminated for security reasons.");
+        console.warn('Packet capture detected');
+        this.handleSecurityThreat('Network traffic monitoring detected. Stream terminated for security reasons.');
       }
     } catch (error) {
-      console.error("Error checking for packet capture:", error);
+      console.error('Error checking for packet capture:', error);
     }
   }
 
   /**
-   * Detects if packet capture tools are being used
+   * Detect packet capture tools
    * @returns {Promise<boolean>} True if packet capture detected
    */
   async detectPacketCapture() {
@@ -299,11 +815,20 @@ class OTTProtectionSystem {
     // Method 3: Network timing analysis
     const hasNetworkTimingAnomaly = await this.checkNetworkTimingAnomaly();
     
+    // Report to server
+    if (this.socket && this.socket.connected) {
+      this.socket.emit('packetCaptureCheck', {
+        processingOverhead: hasProcessingOverhead,
+        performanceAnomaly: hasPerformanceAnomaly,
+        networkTimingAnomaly: hasNetworkTimingAnomaly
+      });
+    }
+    
     return hasProcessingOverhead || hasPerformanceAnomaly || hasNetworkTimingAnomaly;
   }
 
   /**
-   * Check for processing overhead that might indicate packet capture
+   * Check for processing overhead
    * @returns {Promise<boolean>}
    */
   async checkProcessingOverhead() {
@@ -341,27 +866,25 @@ class OTTProtectionSystem {
   }
 
   /**
-   * Check for performance anomalies that might indicate packet capture
+   * Check for performance anomalies
    * @returns {boolean}
    */
   checkPerformanceAnomaly() {
     try {
       // Check if performance entry buffer size is unusually large
-      // (some packet capture tools hook into performance monitoring)
       if (performance && performance.getEntries) {
         const entries = performance.getEntries();
-        // Threshold would need calibration in production
         return entries.length > 1000;
       }
       return false;
     } catch (err) {
-      console.error("Performance check error:", err);
+      console.error('Performance check error:', err);
       return false;
     }
   }
 
   /**
-   * Check for network timing anomalies that might indicate packet capture
+   * Check for network timing anomalies
    * @returns {Promise<boolean>}
    */
   async checkNetworkTimingAnomaly() {
@@ -385,190 +908,4 @@ class OTTProtectionSystem {
                 
                 // Check if there are unusual gaps in the timing
                 const connectTime = entry.connectEnd - entry.connectStart;
-                const requestTime = entry.responseStart - entry.requestStart;
-                
-                // Look for anomalies that might indicate packet interception
-                // These thresholds would need calibration in production
-                const hasAnomaly = 
-                  connectTime > 100 || // Unusually high connect time
-                  requestTime > 500 || // Unusually high request time
-                  Math.abs(loadTime - entry.duration) > 50; // Timing discrepancy
-                
-                resolve(hasAnomaly);
-              } else {
-                resolve(false);
-              }
-            } else {
-              resolve(false);
-            }
-          }, 100);
-        };
-        
-        img.onerror = () => resolve(false);
-        
-        // Load a tiny image to measure network timing
-        img.src = `/api/pixel.gif?_=${random}`;
-      } catch (err) {
-        console.error("Network timing check error:", err);
-        resolve(false);
-      }
-    });
-  }
-
-  /**
-   * Handle detected security threat
-   * @param {string} reason Reason for stopping the stream
-   */
-  handleSecurityThreat(reason) {
-    // Stop the stream immediately
-    this.stopStream(reason);
-    
-    // Log the security incident
-    this.logSecurityIncident(reason);
-    
-    // Stop protection system
-    this.stopProtection();
-  }
-  
-  /**
-   * Stop the video stream
-   * @param {string} reason Reason for stopping
-   */
-  stopStream(reason) {
-    // Implementation depends on streaming technology used
-    // This is a placeholder for actual implementation
-    console.log(`Stream stopped: ${reason}`);
-    
-    // Example: Using HTML5 video element
-    const videoElements = document.querySelectorAll('video');
-    videoElements.forEach(video => {
-      video.pause();
-      if (video.srcObject) {
-        const tracks = video.srcObject.getTracks();
-        tracks.forEach(track => track.stop());
-      }
-      video.srcObject = null;
-      video.src = "";
-      video.removeAttribute('src');
-    });
-    
-    // Display error message to user
-    this.displayErrorMessage(reason);
-  }
-  
-  /**
-   * Display error message to the user
-   * @param {string} message Error message
-   */
-  displayErrorMessage(message) {
-    // Create error overlay
-    const overlay = document.createElement('div');
-    overlay.style.position = 'fixed';
-    overlay.style.top = '0';
-    overlay.style.left = '0';
-    overlay.style.width = '100%';
-    overlay.style.height = '100%';
-    overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.8)';
-    overlay.style.color = 'white';
-    overlay.style.display = 'flex';
-    overlay.style.justifyContent = 'center';
-    overlay.style.alignItems = 'center';
-    overlay.style.zIndex = '9999';
-    overlay.style.textAlign = 'center';
-    overlay.style.padding = '20px';
-    
-    const messageElement = document.createElement('div');
-    messageElement.innerHTML = `
-      <h2>Streaming Error</h2>
-      <p>${message}</p>
-      <p>Please contact support if you believe this is an error.</p>
-    `;
-    
-    overlay.appendChild(messageElement);
-    document.body.appendChild(overlay);
-  }
-  
-  /**
-   * Log security incident for later analysis
-   * @param {string} reason Security incident details
-   */
-  logSecurityIncident(reason) {
-    // In production, send this to your server
-    const incidentData = {
-      timestamp: new Date().toISOString(),
-      reason: reason,
-      userAgent: navigator.userAgent,
-      screenResolution: `${screen.width}x${screen.height}`,
-      // Don't collect sensitive data
-    };
-    
-    console.log("Security incident logged:", incidentData);
-    
-    // In production, you would send this data to your server
-    // Example: 
-    // fetch('/api/security-incidents', {
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify(incidentData)
-    // });
-  }
-}
-
-// Server-side configuration component
-class ServerConfig {
-  /**
-   * Creates server configuration
-   * @param {Object} config Server configuration
-   */
-  static createServer(config = {}) {
-    // This would be implemented on your server
-    // Here's a sample of what the configuration might look like
-    return {
-      // Monitor client speeds and detect anomalies
-      speedMonitoring: {
-        enabled: true,
-        minRequiredSpeed: 1.5, // Mbps
-        anomalyDetectionSensitivity: 0.3, // 30% variation
-        allowedSpeedDrops: 2 // Number of consecutive drops allowed
-      },
-      
-      // Security validations
-      security: {
-        checkVPN: true,
-        checkPacketCapture: true,
-        maxFailedChecks: 3,
-        banDuration: 24 // hours
-      },
-      
-      // Content delivery rules
-      contentDelivery: {
-        chunkSize: 5, // seconds
-        encryptionEnabled: true,
-        dynamicKeyRotation: true,
-        keyRotationInterval: 30 // seconds
-      }
-    };
-  }
-}
-
-// Example usage
-const startProtection = () => {
-  // Create protection system
-  const protectionSystem = new OTTProtectionSystem({
-    maxSpeedVariationThreshold: 0.25, // More sensitive
-    speedCheckInterval: 3000, // Check more frequently
-    vpnCheckInterval: 10000,
-    packetCaptureCheckInterval: 5000
-  });
-
-  // Start monitoring
-  protectionSystem.startProtection();
-  
-  return protectionSystem;
-};
-
-// This would be called when your video player initializes
-// const protection = startProtection();
-
-// To stop the protection manually:
-// protection.stopProtection();
+                const requestTime = entry.responseStart - entry.
