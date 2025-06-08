@@ -1,418 +1,455 @@
-import argparse
-import logging
-import os
-import signal
-import socket
-import struct
-import subprocess
-import threading
+"""
+Vercel-deployable Media Protection API
+Multi-tenant streaming platform security service
+"""
+
+import json
 import time
-from collections import defaultdict
+import hashlib
+import hmac
+import base64
+import os
+import uuid
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import asyncio
+import aiohttp
+import struct
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-try:
-    from scapy.all import sniff, IP, TCP, get_if_addr, conf, ARP, Ether, srp
-except ImportError:
-    print("Scapy is required. Install with: pip install scapy")
-    exit(1)
+# Vercel serverless function handler
+from http.server import BaseHTTPRequestHandler
+import urllib.parse as urlparse
 
-class StreamProtector:
-    def __init__(self, server_ip=None, server_ports=None, interfaces=None, log_file=None):
-        # Configuration
-        self.server_ip = server_ip or self._get_local_ip()
-        self.server_ports = server_ports or []
-        self.interfaces = interfaces or self._get_default_interface()
-        self.active_streams = {}  # {stream_id: {client_ip, port, start_time, bytes_sent}}
-        self.trusted_devices = set()  # Set of known trusted MAC addresses
-        self.blocked_ips = set()  # Set of blocked IP addresses
-        
-        # Protection state
-        self.is_running = False
-        self.lock = threading.Lock()
-        self.poll_interval = 1  # seconds between network scans
-        
-        # Setup logging
-        self.logger = logging.getLogger("StreamProtector")
-        self.logger.setLevel(logging.INFO)
-        
-        if log_file:
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-            self.logger.addHandler(file_handler)
-        
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        self.logger.addHandler(console_handler)
-        
-        # Initialize network state
-        self.current_network_map = {}  # {ip: mac}
-        self.previous_network_map = {}  # To track changes
-        
-        self.logger.info(f"Stream Protector initialized for server {self.server_ip}")
-        self.logger.info(f"Monitoring interfaces: {self.interfaces}")
-        
-    def _get_local_ip(self):
-        """Get the local IP address of the server"""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            return local_ip
-        except Exception as e:
-            return get_if_addr(conf.iface)
-            
-    def _get_default_interface(self):
-        """Get the default network interface"""
-        return [conf.iface]
-        
-    def scan_network(self):
-        """Perform an ARP scan to map devices on the network"""
-        self.logger.debug("Scanning network for devices...")
-        network_map = {}
-        
-        for interface in self.interfaces:
-            try:
-                # Create ARP request for all devices in the subnet
-                ip_range = f"{'.'.join(get_if_addr(interface).split('.')[:3])}.0/24"
-                arp_request = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip_range)
-                
-                # Send the packet and get responses
-                answered, _ = srp(arp_request, timeout=2, verbose=0, iface=interface)
-                
-                # Process responses
-                for sent, received in answered:
-                    network_map[received.psrc] = received.hwsrc
-                    
-            except Exception as e:
-                self.logger.error(f"Error scanning network on interface {interface}: {e}")
-                
-        return network_map
+class PacketCaptureDetector:
+    """Advanced packet capture and anomaly detection"""
     
-    def _detect_new_devices(self, current_map):
-        """Check for new devices on the network"""
-        new_devices = {}
+    def __init__(self):
+        self.suspicious_patterns = {
+            'rapid_requests': {'threshold': 10, 'window': 60},  # 10 requests in 60 seconds
+            'large_bandwidth': {'threshold': 100 * 1024 * 1024},  # 100MB/min
+            'unusual_user_agents': [
+                'wget', 'curl', 'python-requests', 'bot', 'crawler',
+                'spider', 'scraper', 'downloader', 'automation'
+            ],
+            'packet_size_anomaly': {'min': 64, 'max': 1500},  # Normal ethernet MTU
+            'connection_patterns': {
+                'max_concurrent': 5,
+                'min_interval': 1.0  # seconds between requests
+            }
+        }
         
-        for ip, mac in current_map.items():
-            if ip not in self.previous_network_map and ip != self.server_ip:
-                new_devices[ip] = mac
-                
-        return new_devices
+    def analyze_request_headers(self, headers: Dict[str, str]) -> Dict[str, any]:
+        """Analyze HTTP headers for suspicious patterns"""
+        risk_score = 0
+        alerts = []
         
-    def _detect_packet_capture(self, packet):
-        """Detect if the packet might be part of a packet capture attempt"""
-        if IP in packet:
-            src_ip = packet[IP].src
-            dst_ip = packet[IP].dst
-            
-            # If traffic is to/from our server
-            if (dst_ip == self.server_ip or src_ip == self.server_ip):
-                if TCP in packet:
-                    dst_port = packet[TCP].dport
-                    src_port = packet[TCP].sport
-                    
-                    # Check if this is traffic to/from an active stream
-                    stream_key = None
-                    client_ip = None
-                    
-                    if dst_ip == self.server_ip and dst_port in self.server_ports:
-                        stream_key = f"{src_ip}:{src_port}-{dst_port}"
-                        client_ip = src_ip
-                    elif src_ip == self.server_ip and src_port in self.server_ports:
-                        stream_key = f"{dst_ip}:{dst_port}-{src_port}"
-                        client_ip = dst_ip
-                        
-                    if stream_key:
-                        with self.lock:
-                            if stream_key not in self.active_streams:
-                                # New stream
-                                self.active_streams[stream_key] = {
-                                    "client_ip": client_ip,
-                                    "start_time": time.time(),
-                                    "bytes_sent": len(packet),
-                                    "packet_count": 1
-                                }
-                                self.logger.info(f"New stream detected: {stream_key}")
-                            else:
-                                # Update existing stream
-                                self.active_streams[stream_key]["bytes_sent"] += len(packet)
-                                self.active_streams[stream_key]["packet_count"] += 1
-                                
-                    # Check for unauthorized capture
-                    if client_ip and client_ip in self.blocked_ips:
-                        self.logger.warning(f"Detected traffic from blocked IP: {client_ip}")
-                        self._terminate_client_streams(client_ip)
-                        return True
-                        
-        return False
+        user_agent = headers.get('user-agent', '').lower()
+        for suspicious_ua in self.suspicious_patterns['unusual_user_agents']:
+            if suspicious_ua in user_agent:
+                risk_score += 25
+                alerts.append(f"Suspicious User-Agent detected: {suspicious_ua}")
+        
+        # Check for missing common headers
+        expected_headers = ['accept', 'accept-language', 'accept-encoding']
+        missing_headers = [h for h in expected_headers if h not in headers]
+        if len(missing_headers) > 1:
+            risk_score += 15
+            alerts.append(f"Missing common headers: {missing_headers}")
+        
+        # Check for automation indicators
+        if 'x-requested-with' not in headers and 'referer' not in headers:
+            risk_score += 10
+            alerts.append("Direct API access without browser context")
+        
+        return {
+            'risk_score': min(risk_score, 100),
+            'alerts': alerts,
+            'classification': 'high' if risk_score > 50 else 'medium' if risk_score > 25 else 'low'
+        }
     
-    def _check_promiscuous_mode(self):
-        """Detect interfaces in promiscuous mode (potential packet sniffing)"""
-        suspicious_hosts = []
+    def detect_timing_attacks(self, request_history: List[Dict]) -> Dict[str, any]:
+        """Detect timing-based attacks and patterns"""
+        if len(request_history) < 2:
+            return {'risk_score': 0, 'alerts': []}
         
-        try:
-            # This approach uses Linux-specific commands
-            if os.name == "posix":
-                arp_output = subprocess.check_output(["arp", "-a"]).decode("utf-8")
-                lines = arp_output.split("\n")
-                
-                for line in lines:
-                    if "<incomplete>" in line:  # Potential sign of ARP spoofing
-                        parts = line.split()
-                        if len(parts) > 1:
-                            ip = parts[1].strip("()")
-                            suspicious_hosts.append(ip)
-            
-            # Check for unusual ARP entries that might indicate MITM attacks
-            for ip, mac in self.current_network_map.items():
-                for other_ip, other_mac in self.current_network_map.items():
-                    if ip != other_ip and mac == other_mac:
-                        self.logger.warning(f"Potential ARP spoofing detected: {ip} and {other_ip} have same MAC {mac}")
-                        suspicious_hosts.extend([ip, other_ip])
-                        
-        except Exception as e:
-            self.logger.error(f"Error checking for promiscuous mode: {e}")
-            
-        return suspicious_hosts
-    
-    def _terminate_client_streams(self, client_ip):
-        """Terminate all streams from a specific client"""
-        with self.lock:
-            terminated_count = 0
-            streams_to_terminate = []
-            
-            # Identify streams to terminate
-            for stream_id, stream_data in self.active_streams.items():
-                if stream_data["client_ip"] == client_ip:
-                    streams_to_terminate.append(stream_id)
-                    
-            # Terminate identified streams
-            for stream_id in streams_to_terminate:
-                # For TCP streams, send RST packets to force disconnect
-                parts = stream_id.split("-")
-                if len(parts) == 2:
-                    client_addr = parts[0].split(":")
-                    if len(client_addr) == 2:
-                        client_ip = client_addr[0]
-                        client_port = int(client_addr[1])
-                        server_port = int(parts[1])
-                        
-                        try:
-                            # Create and send RST packet to terminate connection
-                            rst_packet = IP(src=self.server_ip, dst=client_ip)/TCP(sport=server_port, dport=client_port, flags="R")
-                            conf.L3socket(iface=self.interfaces[0]).send(rst_packet)
-                            
-                            self.logger.info(f"Sent RST packet to terminate stream {stream_id}")
-                            terminated_count += 1
-                            
-                            # Remove the stream from tracking
-                            del self.active_streams[stream_id]
-                            
-                        except Exception as e:
-                            self.logger.error(f"Failed to terminate stream {stream_id}: {e}")
-                            
-            # Also attempt to block at firewall level if on Linux
-            try:
-                if os.name == "posix" and client_ip not in self.blocked_ips:
-                    subprocess.call(["iptables", "-A", "INPUT", "-s", client_ip, "-j", "DROP"])
-                    subprocess.call(["iptables", "-A", "OUTPUT", "-d", client_ip, "-j", "DROP"])
-                    self.blocked_ips.add(client_ip)
-                    self.logger.info(f"Blocked {client_ip} at firewall level")
-            except Exception as e:
-                self.logger.error(f"Failed to block {client_ip} at firewall: {e}")
-                
-            return terminated_count
-    
-    def _monitor_thread(self):
-        """Background thread to monitor network for unauthorized packet capture"""
-        self.logger.info("Starting network monitoring thread")
+        # Calculate request intervals
+        intervals = []
+        for i in range(1, len(request_history)):
+            interval = request_history[i]['timestamp'] - request_history[i-1]['timestamp']
+            intervals.append(interval)
         
-        while self.is_running:
-            try:
-                # Scan network to update device map
-                self.previous_network_map = self.current_network_map.copy()
-                self.current_network_map = self.scan_network()
-                
-                # Check for new devices
-                new_devices = self._detect_new_devices(self.current_network_map)
-                for ip, mac in new_devices.items():
-                    self.logger.warning(f"New device detected on network: {ip} (MAC: {mac})")
-                    
-                    # Check if this device is associated with any active stream
-                    with self.lock:
-                        for stream_id, stream_data in self.active_streams.items():
-                            if stream_data["client_ip"] == ip:
-                                self.logger.info(f"New device {ip} has an active stream: {stream_id}")
-                
-                # Check for machines in promiscuous mode (potential packet sniffers)
-                suspicious_hosts = self._check_promiscuous_mode()
-                for ip in suspicious_hosts:
-                    self.logger.warning(f"Suspicious network activity from {ip}, terminating any streams")
-                    self._terminate_client_streams(ip)
-                    
-                # Clean up old streams
-                current_time = time.time()
-                with self.lock:
-                    expired_streams = []
-                    for stream_id, stream_data in self.active_streams.items():
-                        if current_time - stream_data["start_time"] > 3600:  # 1 hour timeout
-                            expired_streams.append(stream_id)
-                            
-                    for stream_id in expired_streams:
-                        del self.active_streams[stream_id]
-                        
-                # Sleep before next check
-                time.sleep(self.poll_interval)
-                
-            except Exception as e:
-                self.logger.error(f"Error in monitor thread: {e}")
-                time.sleep(5)  # Wait before retry on error
-    
-    def packet_handler(self, packet):
-        """Process each captured packet to detect capture attempts"""
-        if self._detect_packet_capture(packet):
-            self.logger.warning("Packet capture attempt detected and blocked")
-    
-    def start(self):
-        """Start the stream protection service"""
-        self.logger.info("Starting Stream Protector service")
-        self.is_running = True
+        avg_interval = sum(intervals) / len(intervals)
+        risk_score = 0
+        alerts = []
         
-        # Start the monitoring thread
-        self.monitor_thread = threading.Thread(target=self._monitor_thread)
-        self.monitor_thread.daemon = True
-        self.monitor_thread.start()
+        # Too rapid requests
+        if avg_interval < self.suspicious_patterns['connection_patterns']['min_interval']:
+            risk_score += 30
+            alerts.append(f"Rapid fire requests detected: {avg_interval:.2f}s average interval")
         
-        # Start packet capture
-        try:
-            for interface in self.interfaces:
-                self.logger.info(f"Starting packet capture on {interface}")
-                capture_thread = threading.Thread(
-                    target=lambda: sniff(
-                        iface=interface,
-                        filter="ip",
-                        prn=self.packet_handler,
-                        store=0
-                    )
-                )
-                capture_thread.daemon = True
-                capture_thread.start()
-                
-            # Wait for shutdown signal
-            while self.is_running:
-                time.sleep(1)
-                
-        except KeyboardInterrupt:
-            self.logger.info("Received shutdown signal")
-        except Exception as e:
-            self.logger.error(f"Error during packet capture: {e}")
-        finally:
-            self.stop()
-    
-    def stop(self):
-        """Stop the stream protection service"""
-        self.logger.info("Stopping Stream Protector service")
-        self.is_running = False
+        # Too regular intervals (bot-like behavior)
+        if len(set([round(i, 1) for i in intervals])) == 1 and len(intervals) > 5:
+            risk_score += 40
+            alerts.append("Highly regular request pattern detected (bot-like)")
         
-        # Clean up firewall rules if any
-        if os.name == "posix":
-            for ip in self.blocked_ips:
-                try:
-                    subprocess.call(["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"])
-                    subprocess.call(["iptables", "-D", "OUTPUT", "-d", ip, "-j", "DROP"])
-                except:
-                    pass
+        return {
+            'risk_score': min(risk_score, 100),
+            'alerts': alerts,
+            'avg_interval': avg_interval
+        }
 
-# Server application integration code
-class StreamServer:
-    """Example server that integrates with the StreamProtector"""
+class MediaProtectionAPI:
+    """Main API class for media protection service"""
     
-    def __init__(self, protection_url, server_port=8080):
-        self.protection_url = protection_url
-        self.server_port = server_port
-        self.protector = None
-        self.logger = logging.getLogger("StreamServer")
-        self.logger.setLevel(logging.INFO)
+    def __init__(self):
+        self.packet_detector = PacketCaptureDetector()
+        self.client_sessions = {}  # Store client session data
+        self.rate_limits = {}  # Rate limiting data
         
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        self.logger.addHandler(handler)
+    def generate_api_key(self, client_id: str) -> str:
+        """Generate API key for client"""
+        timestamp = str(int(time.time()))
+        data = f"{client_id}:{timestamp}"
+        return base64.b64encode(data.encode()).decode()
+    
+    def validate_api_key(self, api_key: str) -> Optional[str]:
+        """Validate API key and return client_id"""
+        try:
+            decoded = base64.b64decode(api_key).decode()
+            client_id, timestamp = decoded.split(':')
+            # Add expiration logic if needed
+            return client_id
+        except:
+            return None
+    
+    def generate_encryption_key(self, password: str, salt: bytes = None) -> bytes:
+        """Generate encryption key"""
+        if salt is None:
+            salt = b'streaming_protection_2024'
         
-    def start_protection(self):
-        """Initialize and start the stream protection module"""
-        self.logger.info(f"Initializing stream protection on port {self.server_port}")
-        
-        # Parse the protection URL for configuration
-        # Format: protocol://host:port/path?interface=eth0&log=/var/log/protector.log
-        import urllib.parse
-        parsed_url = urllib.parse.urlparse(self.protection_url)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
-        
-        # Extract configuration from URL
-        interfaces = query_params.get('interface', [None])[0]
-        interfaces = [interfaces] if interfaces else None
-        
-        log_file = query_params.get('log', [None])[0]
-        
-        # Initialize the protector
-        self.protector = StreamProtector(
-            server_ports=[self.server_port],
-            interfaces=interfaces,
-            log_file=log_file
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
         )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        return key
+    
+    async def send_webhook(self, webhook_url: str, data: Dict, secret: str = None):
+        """Send webhook notification"""
+        payload = json.dumps(data)
+        headers = {'Content-Type': 'application/json'}
         
-        # Start protection in a separate thread
-        protection_thread = threading.Thread(target=self.protector.start)
-        protection_thread.daemon = True
-        protection_thread.start()
+        if secret:
+            signature = hmac.new(
+                secret.encode(),
+                payload.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            headers['X-Signature-SHA256'] = f"sha256={signature}"
         
-        self.logger.info("Stream protection started")
-        return True
-        
-    def stream_data(self, client_address):
-        """Stream data to a client with protection active"""
-        client_ip, client_port = client_address
-        
-        # Check if client is blocked
-        if self.protector and client_ip in self.protector.blocked_ips:
-            self.logger.warning(f"Rejecting connection from blocked client: {client_ip}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(webhook_url, data=payload, headers=headers, timeout=10) as response:
+                    return response.status == 200
+        except:
             return False
+    
+    def encrypt_media(self, media_data: bytes, client_id: str, metadata: Dict = None) -> Dict:
+        """Encrypt media with protection metadata"""
+        try:
+            # Generate client-specific key
+            encryption_key = self.generate_encryption_key(f"{client_id}_media_key")
+            fernet = Fernet(encryption_key)
             
-        # Register this stream with the protector
-        stream_id = f"{client_ip}:{client_port}-{self.server_port}"
-        
-        with self.protector.lock:
-            self.protector.active_streams[stream_id] = {
-                "client_ip": client_ip,
-                "start_time": time.time(),
-                "bytes_sent": 0,
-                "packet_count": 0
+            # Calculate protection metrics
+            original_size = len(media_data)
+            checksum = hashlib.sha256(media_data).hexdigest()
+            
+            protection_metadata = {
+                'client_id': client_id,
+                'original_size': original_size,
+                'checksum': checksum,
+                'encryption_timestamp': time.time(),
+                'session_id': str(uuid.uuid4()),
+                'expected_metrics': {
+                    'max_bandwidth': 50 * 1024 * 1024,  # 50MB/s
+                    'min_bandwidth': 1024 * 1024,  # 1MB/s
+                    'max_concurrent_streams': 3
+                },
+                'custom_metadata': metadata or {}
             }
             
-        self.logger.info(f"Registered stream {stream_id} with protector")
-        return True
+            # Encrypt data
+            encrypted_data = fernet.encrypt(media_data)
+            
+            # Create protected package
+            metadata_json = json.dumps(protection_metadata).encode()
+            metadata_size = struct.pack('I', len(metadata_json))
+            
+            protected_content = metadata_size + metadata_json + encrypted_data
+            
+            return {
+                'status': 'success',
+                'session_id': protection_metadata['session_id'],
+                'protected_content': base64.b64encode(protected_content).decode(),
+                'original_size': original_size,
+                'protected_size': len(protected_content)
+            }
+            
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+    
+    def validate_and_decrypt(self, protected_content: str, client_id: str, 
+                           request_headers: Dict, client_ip: str) -> Dict:
+        """Validate protection requirements and decrypt if passed"""
+        try:
+            # Decode protected content
+            content_bytes = base64.b64decode(protected_content)
+            
+            # Extract metadata
+            metadata_size = struct.unpack('I', content_bytes[:4])[0]
+            metadata_json = content_bytes[4:4+metadata_size]
+            encrypted_data = content_bytes[4+metadata_size:]
+            
+            protection_metadata = json.loads(metadata_json.decode())
+            
+            # Validate client
+            if protection_metadata['client_id'] != client_id:
+                return {'status': 'error', 'message': 'Client ID mismatch'}
+            
+            # Security Analysis
+            header_analysis = self.packet_detector.analyze_request_headers(request_headers)
+            
+            # Get request history for this client
+            if client_id not in self.client_sessions:
+                self.client_sessions[client_id] = []
+            
+            # Add current request to history
+            current_request = {
+                'timestamp': time.time(),
+                'ip': client_ip,
+                'headers': request_headers,
+                'session_id': protection_metadata['session_id']
+            }
+            self.client_sessions[client_id].append(current_request)
+            
+            # Keep only last 50 requests
+            self.client_sessions[client_id] = self.client_sessions[client_id][-50:]
+            
+            timing_analysis = self.packet_detector.detect_timing_attacks(
+                self.client_sessions[client_id]
+            )
+            
+            # Calculate overall risk score
+            total_risk_score = (header_analysis['risk_score'] + timing_analysis['risk_score']) / 2
+            
+            # Decision logic
+            validation_result = {
+                'session_id': protection_metadata['session_id'],
+                'risk_score': total_risk_score,
+                'header_analysis': header_analysis,
+                'timing_analysis': timing_analysis,
+                'client_ip': client_ip,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Decrypt if validation passed
+            if total_risk_score < 60:  # Threshold for allowing access
+                encryption_key = self.generate_encryption_key(f"{client_id}_media_key")
+                fernet = Fernet(encryption_key)
+                decrypted_data = fernet.decrypt(encrypted_data)
+                
+                # Verify integrity
+                actual_checksum = hashlib.sha256(decrypted_data).hexdigest()
+                if actual_checksum != protection_metadata['checksum']:
+                    return {
+                        'status': 'error',
+                        'message': 'Content integrity check failed',
+                        'validation_result': validation_result
+                    }
+                
+                return {
+                    'status': 'approved',
+                    'quality': 'original',
+                    'content_size': len(decrypted_data),
+                    'validation_result': validation_result,
+                    'decrypted_content': base64.b64encode(decrypted_data).decode()
+                }
+            else:
+                return {
+                    'status': 'blocked',
+                    'quality': 'denied',
+                    'reason': 'High risk score detected',
+                    'validation_result': validation_result
+                }
+                
+        except Exception as e:
+            return {'status': 'error', 'message': str(e)}
+
+# Vercel Handler Class
+class handler(BaseHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        self.api = MediaProtectionAPI()
+        super().__init__(*args, **kwargs)
+    
+    def _set_headers(self, status_code=200):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key')
+        self.end_headers()
+    
+    def do_OPTIONS(self):
+        self._set_headers()
+    
+    def do_GET(self):
+        """Handle GET requests"""
+        parsed_path = urlparse.urlparse(self.path)
+        path = parsed_path.path
         
-    def stop_protection(self):
-        """Stop the protection module"""
-        if self.protector:
-            self.protector.stop()
-            self.logger.info("Stream protection stopped")
+        if path == '/health':
+            self._set_headers()
+            response = {
+                'status': 'healthy',
+                'timestamp': datetime.now().isoformat(),
+                'service': 'Media Protection API'
+            }
+            self.wfile.write(json.dumps(response).encode())
+        
+        elif path == '/generate-key':
+            # Generate API key for new client
+            query_params = urlparse.parse_qs(parsed_path.query)
+            client_id = query_params.get('client_id', [None])[0]
+            
+            if not client_id:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({'error': 'client_id required'}).encode())
+                return
+            
+            api_key = self.api.generate_api_key(client_id)
+            self._set_headers()
+            response = {
+                'client_id': client_id,
+                'api_key': api_key,
+                'generated_at': datetime.now().isoformat()
+            }
+            self.wfile.write(json.dumps(response).encode())
+        
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({'error': 'Endpoint not found'}).encode())
+    
+    def do_POST(self):
+        """Handle POST requests"""
+        try:
+            # Get request headers
+            headers = dict(self.headers)
+            
+            # Validate API key
+            api_key = headers.get('x-api-key')
+            if not api_key:
+                self._set_headers(401)
+                self.wfile.write(json.dumps({'error': 'API key required'}).encode())
+                return
+            
+            client_id = self.api.validate_api_key(api_key)
+            if not client_id:
+                self._set_headers(401)
+                self.wfile.write(json.dumps({'error': 'Invalid API key'}).encode())
+                return
+            
+            # Get client IP
+            client_ip = headers.get('x-forwarded-for', self.client_address[0])
+            
+            # Read request body
+            content_length = int(headers.get('content-length', 0))
+            post_data = self.rfile.read(content_length)
+            
+            try:
+                request_data = json.loads(post_data.decode())
+            except json.JSONDecodeError:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode())
+                return
+            
+            parsed_path = urlparse.urlparse(self.path)
+            path = parsed_path.path
+            
+            if path == '/encrypt':
+                # Encrypt media content
+                media_data = base64.b64decode(request_data.get('media_data', ''))
+                metadata = request_data.get('metadata', {})
+                
+                result = self.api.encrypt_media(media_data, client_id, metadata)
+                self._set_headers()
+                self.wfile.write(json.dumps(result).encode())
+            
+            elif path == '/validate':
+                # Validate and potentially decrypt content
+                protected_content = request_data.get('protected_content', '')
+                
+                result = self.api.validate_and_decrypt(
+                    protected_content, client_id, headers, client_ip
+                )
+                
+                # Send webhook if configured
+                webhook_url = request_data.get('webhook_url')
+                if webhook_url and result.get('validation_result'):
+                    webhook_data = {
+                        'event': 'validation_completed',
+                        'client_id': client_id,
+                        'result': result['status'],
+                        'risk_score': result['validation_result']['risk_score'],
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    # Send webhook asynchronously (in real implementation)
+                    # asyncio.create_task(self.api.send_webhook(webhook_url, webhook_data))
+                
+                self._set_headers()
+                self.wfile.write(json.dumps(result).encode())
+            
+            elif path == '/analytics':
+                # Get analytics for client
+                analytics_data = {
+                    'client_id': client_id,
+                    'session_count': len(self.api.client_sessions.get(client_id, [])),
+                    'recent_requests': self.api.client_sessions.get(client_id, [])[-10:],
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                self._set_headers()
+                self.wfile.write(json.dumps(analytics_data).encode())
+            
+            else:
+                self._set_headers(404)
+                self.wfile.write(json.dumps({'error': 'Endpoint not found'}).encode())
+        
+        except Exception as e:
+            self._set_headers(500)
+            error_response = {
+                'error': 'Internal server error',
+                'message': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+            self.wfile.write(json.dumps(error_response).encode())
 
-def main():
-    parser = argparse.ArgumentParser(description="Stream Protection Service")
-    parser.add_argument("--url", required=True, help="URL of the protection module with configuration")
-    parser.add_argument("--port", type=int, default=8080, help="Server port to protect")
+# For local testing
+if __name__ == '__main__':
+    from http.server import HTTPServer
     
-    args = parser.parse_args()
-    
-    # Example of integrating with a server
-    server = StreamServer(args.url, args.port)
-    server.start_protection()
-    
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        server.stop_protection()
-
-if __name__ == "__main__":
-    main()
+    server = HTTPServer(('localhost', 8000), handler)
+    print("Media Protection API running on http://localhost:8000")
+    print("Available endpoints:")
+    print("  GET  /health - Health check")
+    print("  GET  /generate-key?client_id=xxx - Generate API key")
+    print("  POST /encrypt - Encrypt media content")
+    print("  POST /validate - Validate and decrypt content")
+    print("  POST /analytics - Get client analytics")
+    server.serve_forever()
